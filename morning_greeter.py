@@ -283,12 +283,65 @@ class VisitorTracker:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class MorningGreeter:
-    def __init__(self, cooldown_s: float = 20.0) -> None:
+    def __init__(
+        self,
+        cooldown_s: float = 20.0,
+        show_video: bool = False,
+        debug_detections: bool = False,
+    ) -> None:
         self._detector = FaceDetector()
         self._tracker = VisitorTracker(cooldown_s)
         self._tts = _build_tts_engine()
         self._greeting_idx = 0
         self._running = False
+        self._show_video = show_video
+        self._debug_detections = debug_detections
+        self._debug_last_log_at = 0.0
+        self._debug_frames = 0
+
+    def _draw_debug_overlay(self, frame: np.ndarray, faces: list[tuple[int, int, int, int]]) -> np.ndarray:
+        """Draw face boxes and status text on a copy of the frame for display."""
+        overlay = frame.copy()
+        for x, y, w, h in faces:
+            cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 80), 2)
+            cv2.putText(
+                overlay,
+                f"face {w}x{h}",
+                (x, max(18, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 80),
+                1,
+            )
+
+        status = "FACE DETECTED" if faces else "Watching..."
+        cv2.putText(
+            overlay,
+            f"Reachy Mini Morning Greeter  [{status}]",
+            (10, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 200, 255),
+            2,
+        )
+        return overlay
+
+    def _log_detection_debug(self, faces: list[tuple[int, int, int, int]]) -> None:
+        """Print low-rate detection debug to avoid flooding the console."""
+        if not self._debug_detections:
+            return
+
+        now = time.time()
+        self._debug_frames += 1
+        if now - self._debug_last_log_at < 1.0:
+            return
+
+        self._debug_last_log_at = now
+        if faces:
+            faces_str = ", ".join(f"(x={x}, y={y}, w={w}, h={h})" for x, y, w, h in faces)
+            print(f"[DEBUG] frames={self._debug_frames} faces={len(faces)} {faces_str}")
+        else:
+            print(f"[DEBUG] frames={self._debug_frames} faces=0")
 
     # ── Greeting orchestration ────────────────────────────────────────────────
 
@@ -357,6 +410,11 @@ class MorningGreeter:
                     continue
 
                 faces = self._detector.detect(frame)
+                self._log_detection_debug(faces)
+
+                if self._show_video:
+                    overlay = self._draw_debug_overlay(frame, faces)
+                    cv2.imshow("Reachy Mini - Morning Greeter (Robot Camera)", overlay)
 
                 if faces:
                     self._tracker.on_face_seen()
@@ -365,7 +423,14 @@ class MorningGreeter:
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
 
+                if self._show_video and (cv2.waitKey(1) & 0xFF == ord("q")):
+                    print("[INFO] Q pressed — stopping.")
+                    break
+
                 time.sleep(0.08)   # ~12 fps polling
+
+        if self._show_video:
+            cv2.destroyAllWindows()
 
     def run_with_webcam(self, mini: "ReachyMini | None" = None) -> None:
         """
@@ -391,18 +456,11 @@ class MorningGreeter:
                     continue
 
                 faces = self._detector.detect(frame)
+                self._log_detection_debug(faces)
 
-                # ── Visual overlay ────────────────────────────────────────────
-                for x, y, w, h in faces:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 80), 2)
-                status = (
-                    "FACE DETECTED" if faces else "Watching..."
-                )
-                cv2.putText(
-                    frame, f"Reachy Mini Morning Greeter  [{status}]",
-                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2,
-                )
-                cv2.imshow("Reachy Mini - Morning Greeter", frame)
+                if self._show_video:
+                    overlay = self._draw_debug_overlay(frame, faces)
+                    cv2.imshow("Reachy Mini - Morning Greeter", overlay)
 
                 # ── Greeting logic ────────────────────────────────────────────
                 if faces:
@@ -412,7 +470,7 @@ class MorningGreeter:
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
 
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if self._show_video and (cv2.waitKey(1) & 0xFF == ord("q")):
                     print("[INFO] Q pressed — stopping.")
                     break
 
@@ -463,9 +521,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             "(default: 20). Set to 0 to greet every time a face reappears."
         ),
     )
+    parser.add_argument(
+        "--show-video",
+        action="store_true",
+        help=(
+            "Show live video with face boxes and status text. "
+            "Works for both robot camera and webcam mode. Press Q to quit."
+        ),
+    )
+    parser.add_argument(
+        "--debug-detections",
+        action="store_true",
+        help="Print face detection debug logs (~1 line/second) to the console.",
+    )
     args = parser.parse_args(argv)
 
-    greeter = MorningGreeter(cooldown_s=args.cooldown)
+    greeter = MorningGreeter(
+        cooldown_s=args.cooldown,
+        show_video=args.show_video,
+        debug_detections=args.debug_detections,
+    )
 
     try:
         if args.no_robot or not REACHY_AVAILABLE:
