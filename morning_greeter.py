@@ -49,6 +49,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -288,6 +289,8 @@ class MorningGreeter:
         cooldown_s: float = 20.0,
         show_video: bool = False,
         debug_detections: bool = False,
+        save_detection_frames: int = 10,
+        save_dir: str = "debug_detections",
     ) -> None:
         self._detector = FaceDetector()
         self._tracker = VisitorTracker(cooldown_s)
@@ -298,6 +301,18 @@ class MorningGreeter:
         self._debug_detections = debug_detections
         self._debug_last_log_at = 0.0
         self._debug_frames = 0
+        self._save_detection_frames_remaining = max(0, save_detection_frames)
+        self._save_detection_frame_idx = 0
+        self._save_dir = Path(save_dir)
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        self._video_error_reported = False
+
+        if self._save_detection_frames_remaining > 0:
+            print(
+                "[DEBUG] Will save first "
+                f"{self._save_detection_frames_remaining} frames with detections to "
+                f"{self._save_dir.resolve()}"
+            )
 
     def _draw_debug_overlay(self, frame: np.ndarray, faces: list[tuple[int, int, int, int]]) -> np.ndarray:
         """Draw face boxes and status text on a copy of the frame for display."""
@@ -342,6 +357,46 @@ class MorningGreeter:
             print(f"[DEBUG] frames={self._debug_frames} faces={len(faces)} {faces_str}")
         else:
             print(f"[DEBUG] frames={self._debug_frames} faces=0")
+
+    def _save_detection_frame(self, frame: np.ndarray, faces: list[tuple[int, int, int, int]]) -> None:
+        """Save first N frames that contain detections for offline debugging."""
+        if self._save_detection_frames_remaining <= 0 or not faces:
+            return
+
+        self._save_detection_frame_idx += 1
+        filename = (
+            f"det_{self._save_detection_frame_idx:03d}_"
+            f"{int(time.time() * 1000)}_faces{len(faces)}.jpg"
+        )
+        output_path = self._save_dir / filename
+        ok = cv2.imwrite(str(output_path), frame)
+        if ok:
+            self._save_detection_frames_remaining -= 1
+            print(
+                f"[DEBUG] Saved detection frame: {output_path} "
+                f"({self._save_detection_frames_remaining} remaining)"
+            )
+            if self._save_detection_frames_remaining == 0:
+                print("[DEBUG] Detection frame capture limit reached.")
+
+    def _show_debug_window(self, title: str, frame: np.ndarray) -> bool:
+        """Show debug window and return True if user requested quit with Q."""
+        if not self._show_video:
+            return False
+
+        try:
+            cv2.imshow(title, frame)
+            return (cv2.waitKey(1) & 0xFF) == ord("q")
+        except cv2.error as exc:
+            if not self._video_error_reported:
+                print(
+                    "[WARNING] Could not display debug window. "
+                    "Continuing without video preview. "
+                    f"Reason: {exc}"
+                )
+                self._video_error_reported = True
+            self._show_video = False
+            return False
 
     # ── Greeting orchestration ────────────────────────────────────────────────
 
@@ -412,9 +467,20 @@ class MorningGreeter:
                 faces = self._detector.detect(frame)
                 self._log_detection_debug(faces)
 
-                if self._show_video:
+                overlay = None
+                if self._show_video or (self._save_detection_frames_remaining > 0 and faces):
                     overlay = self._draw_debug_overlay(frame, faces)
-                    cv2.imshow("Reachy Mini - Morning Greeter (Robot Camera)", overlay)
+
+                if faces:
+                    self._save_detection_frame(overlay if overlay is not None else frame, faces)
+
+                if self._show_video:
+                    if self._show_debug_window(
+                        "Reachy Mini - Morning Greeter (Robot Camera)",
+                        overlay if overlay is not None else frame,
+                    ):
+                        print("[INFO] Q pressed — stopping.")
+                        break
 
                 if faces:
                     self._tracker.on_face_seen()
@@ -422,10 +488,6 @@ class MorningGreeter:
                         self._tracker.mark_greeted()
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
-
-                if self._show_video and (cv2.waitKey(1) & 0xFF == ord("q")):
-                    print("[INFO] Q pressed — stopping.")
-                    break
 
                 time.sleep(0.08)   # ~12 fps polling
 
@@ -458,9 +520,20 @@ class MorningGreeter:
                 faces = self._detector.detect(frame)
                 self._log_detection_debug(faces)
 
-                if self._show_video:
+                overlay = None
+                if self._show_video or (self._save_detection_frames_remaining > 0 and faces):
                     overlay = self._draw_debug_overlay(frame, faces)
-                    cv2.imshow("Reachy Mini - Morning Greeter", overlay)
+
+                if faces:
+                    self._save_detection_frame(overlay if overlay is not None else frame, faces)
+
+                if self._show_video:
+                    if self._show_debug_window(
+                        "Reachy Mini - Morning Greeter",
+                        overlay if overlay is not None else frame,
+                    ):
+                        print("[INFO] Q pressed — stopping.")
+                        break
 
                 # ── Greeting logic ────────────────────────────────────────────
                 if faces:
@@ -469,10 +542,6 @@ class MorningGreeter:
                         self._tracker.mark_greeted()
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
-
-                if self._show_video and (cv2.waitKey(1) & 0xFF == ord("q")):
-                    print("[INFO] Q pressed — stopping.")
-                    break
 
                 time.sleep(0.05)   # ~20 fps
 
@@ -534,12 +603,30 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="store_true",
         help="Print face detection debug logs (~1 line/second) to the console.",
     )
+    parser.add_argument(
+        "--save-detection-frames",
+        type=int,
+        default=10,
+        metavar="N",
+        help=(
+            "Save the first N frames containing face detections to disk "
+            "for debugging (default: 10, set 0 to disable)."
+        ),
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default="debug_detections",
+        help="Directory where detection debug frames are saved.",
+    )
     args = parser.parse_args(argv)
 
     greeter = MorningGreeter(
         cooldown_s=args.cooldown,
         show_video=args.show_video,
         debug_detections=args.debug_detections,
+        save_detection_frames=args.save_detection_frames,
+        save_dir=args.save_dir,
     )
 
     try:
