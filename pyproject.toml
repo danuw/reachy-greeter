@@ -1,0 +1,25 @@
+[project]
+name = "reachy-mini-morning-greeter"
+version = "0.1.0"
+description = "Reachy Mini spontaneous morning greeter — detects a face and says good morning."
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "pyttsx3>=2.90",
+    "numpy>=1.24",
+    "reachy-mini",
+]
+
+[project.optional-dependencies]
+# Adds MuJoCo simulation support (needed for --sim mode)
+sim = ["reachy-mini[mujoco]"]
+
+[project.scripts]
+morning-greeter = "morning_greeter:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["morning_greeter.py"]

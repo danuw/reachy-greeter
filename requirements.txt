@@ -1,0 +1,15 @@
+# Reachy Mini Morning Greeter — dependencies
+
+# Reachy Mini SDK (install with simulation support if needed)
+# pip install reachy-mini
+# pip install "reachy-mini[mujoco]"   # adds MuJoCo simulation
+
+# Computer vision — face detection via Haar cascade (bundled with opencv)
+opencv-python>=4.8
+
+# Offline TTS — uses Windows SAPI5 (Zira/David) or macOS/Linux system voices
+# No internet required, no API key needed
+pyttsx3>=2.90
+
+# Numerical array support (usually already installed as a transitive dep)
+numpy>=1.24
