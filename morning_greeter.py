@@ -90,6 +90,11 @@ MIN_FACE_PX: int = 80
 HAAR_SCALE_FACTOR: float = 1.3
 HAAR_MIN_NEIGHBORS: int = 5
 
+# Tracking and diagnostics tuning
+TRACK_MAX_MISSING_S: float = 2.5
+TRACK_MATCH_MAX_DIST_PX: float = 120.0
+NO_FRAME_WARN_INTERVAL_S: float = 3.0
+
 # Greeting messages (cycled in order so repeat visits get variety)
 GREETINGS: list[str] = [
     "Good morning! How are you today?",
@@ -240,43 +245,105 @@ class FaceDetector:
 #  Visitor tracker  (presence / absence logic)
 # ═════════════════════════════════════════════════════════════════════════════
 
-class VisitorTracker:
+class PersonTracker:
     """
-    Tracks whether we've already greeted the current visitor.
+    Lightweight online face tracking by centroid distance.
 
-    State machine:
-      - Faces absent for > FACE_ABSENT_RESET_S  →  visitor left; reset flag.
-      - Face detected + not yet greeted + cooldown elapsed  →  greet!
+    This is not biometric identification, but it keeps a stable ID while the
+    same person stays in view and prevents repetitive greetings.
     """
 
-    def __init__(self, cooldown_s: float) -> None:
-        self._cooldown_s = cooldown_s
-        self._last_face_at: float = 0.0
-        self._last_greeted_at: float = 0.0
-        self._greeted_this_visit: bool = False
+    def __init__(self, global_cooldown_s: float, same_person_cooldown_s: float) -> None:
+        self._global_cooldown_s = global_cooldown_s
+        self._same_person_cooldown_s = same_person_cooldown_s
+        self._tracks: dict[int, dict[str, float | tuple[int, int, int, int] | bool]] = {}
+        self._next_id = 1
+        self._last_any_greet_at = 0.0
         self._lock = threading.Lock()
 
-    def on_face_seen(self) -> None:
-        with self._lock:
-            self._last_face_at = time.time()
+    @staticmethod
+    def _center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+        x, y, w, h = box
+        return (x + w / 2.0, y + h / 2.0)
 
-    def should_greet(self) -> bool:
+    @staticmethod
+    def _dist(a: tuple[float, float], b: tuple[float, float]) -> float:
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        return float((dx * dx + dy * dy) ** 0.5)
+
+    def update(self, faces: list[tuple[int, int, int, int]]) -> list[tuple[int, tuple[int, int, int, int]]]:
+        """Assign detections to tracks and return [(track_id, box), ...]."""
         now = time.time()
         with self._lock:
-            # Reset greeted flag if visitor has been gone long enough
-            if now - self._last_face_at > FACE_ABSENT_RESET_S:
-                self._greeted_this_visit = False
+            # Drop stale tracks that disappeared.
+            stale_ids = [
+                track_id
+                for track_id, track in self._tracks.items()
+                if now - float(track["last_seen_at"]) > TRACK_MAX_MISSING_S
+            ]
+            for track_id in stale_ids:
+                del self._tracks[track_id]
 
-            if self._greeted_this_visit:
+            unmatched_ids = set(self._tracks.keys())
+            assignments: list[tuple[int, tuple[int, int, int, int]]] = []
+
+            for face in faces:
+                fc = self._center(face)
+                best_id = None
+                best_dist = float("inf")
+
+                for track_id in unmatched_ids:
+                    track_box = self._tracks[track_id]["box"]
+                    if not isinstance(track_box, tuple):
+                        continue
+                    tc = self._center(track_box)
+                    d = self._dist(fc, tc)
+                    if d < best_dist:
+                        best_dist = d
+                        best_id = track_id
+
+                if best_id is not None and best_dist <= TRACK_MATCH_MAX_DIST_PX:
+                    self._tracks[best_id]["box"] = face
+                    self._tracks[best_id]["last_seen_at"] = now
+                    assignments.append((best_id, face))
+                    unmatched_ids.remove(best_id)
+                else:
+                    new_id = self._next_id
+                    self._next_id += 1
+                    self._tracks[new_id] = {
+                        "box": face,
+                        "last_seen_at": now,
+                        "last_greeted_at": 0.0,
+                    }
+                    assignments.append((new_id, face))
+
+            return assignments
+
+    def should_greet(self, track_id: int) -> bool:
+        now = time.time()
+        with self._lock:
+            track = self._tracks.get(track_id)
+            if track is None:
                 return False
-            if now - self._last_greeted_at < self._cooldown_s:
+
+            if now - self._last_any_greet_at < self._global_cooldown_s:
                 return False
+
+            last_greeted_at = float(track["last_greeted_at"])
+            if last_greeted_at > 0 and now - last_greeted_at < self._same_person_cooldown_s:
+                return False
+
             return True
 
-    def mark_greeted(self) -> None:
+    def mark_greeted(self, track_id: int) -> None:
+        now = time.time()
         with self._lock:
-            self._last_greeted_at = time.time()
-            self._greeted_this_visit = True
+            track = self._tracks.get(track_id)
+            if track is None:
+                return
+            track["last_greeted_at"] = now
+            self._last_any_greet_at = now
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -291,9 +358,22 @@ class MorningGreeter:
         debug_detections: bool = False,
         save_detection_frames: int = 10,
         save_dir: str = "debug_detections",
+        same_person_cooldown_s: float = 300.0,
+        robot_media_backend: str = "default",
+        no_frame_timeout_s: float = 8.0,
+        fallback_webcam_if_no_robot_video: bool = False,
+        webcam_index: int = 0,
+        webcam_backend: str = "auto",
+        robot_name: str = "reachy_mini",
+        robot_host: str = "reachy-mini.local",
+        robot_port: int = 8000,
+        connection_mode: str = "auto",
     ) -> None:
         self._detector = FaceDetector()
-        self._tracker = VisitorTracker(cooldown_s)
+        self._tracker = PersonTracker(
+            global_cooldown_s=cooldown_s,
+            same_person_cooldown_s=same_person_cooldown_s,
+        )
         self._tts = _build_tts_engine()
         self._greeting_idx = 0
         self._running = False
@@ -306,6 +386,17 @@ class MorningGreeter:
         self._save_dir = Path(save_dir)
         self._save_dir.mkdir(parents=True, exist_ok=True)
         self._video_error_reported = False
+        self._last_no_frame_warn_at = 0.0
+        self._first_frame_logged = False
+        self._robot_media_backend = robot_media_backend
+        self._no_frame_timeout_s = max(1.0, no_frame_timeout_s)
+        self._fallback_webcam_if_no_robot_video = fallback_webcam_if_no_robot_video
+        self._webcam_index = webcam_index
+        self._webcam_backend = webcam_backend
+        self._robot_name = robot_name
+        self._robot_host = robot_host
+        self._robot_port = robot_port
+        self._connection_mode = connection_mode
 
         if self._save_detection_frames_remaining > 0:
             print(
@@ -314,14 +405,19 @@ class MorningGreeter:
                 f"{self._save_dir.resolve()}"
             )
 
-    def _draw_debug_overlay(self, frame: np.ndarray, faces: list[tuple[int, int, int, int]]) -> np.ndarray:
-        """Draw face boxes and status text on a copy of the frame for display."""
+    def _draw_debug_overlay(
+        self,
+        frame: np.ndarray,
+        tracked_faces: list[tuple[int, tuple[int, int, int, int]]],
+        source_label: str,
+    ) -> np.ndarray:
+        """Draw tracked face boxes and status text on a copy of the frame."""
         overlay = frame.copy()
-        for x, y, w, h in faces:
+        for track_id, (x, y, w, h) in tracked_faces:
             cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 80), 2)
             cv2.putText(
                 overlay,
-                f"face {w}x{h}",
+                f"id:{track_id} {w}x{h}",
                 (x, max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -329,10 +425,10 @@ class MorningGreeter:
                 1,
             )
 
-        status = "FACE DETECTED" if faces else "Watching..."
+        status = "FACE DETECTED" if tracked_faces else "Watching..."
         cv2.putText(
             overlay,
-            f"Reachy Mini Morning Greeter  [{status}]",
+            f"Reachy Mini Morning Greeter ({source_label})  [{status}]",
             (10, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
@@ -341,7 +437,7 @@ class MorningGreeter:
         )
         return overlay
 
-    def _log_detection_debug(self, faces: list[tuple[int, int, int, int]]) -> None:
+    def _log_detection_debug(self, tracked_faces: list[tuple[int, tuple[int, int, int, int]]]) -> None:
         """Print low-rate detection debug to avoid flooding the console."""
         if not self._debug_detections:
             return
@@ -352,11 +448,42 @@ class MorningGreeter:
             return
 
         self._debug_last_log_at = now
-        if faces:
-            faces_str = ", ".join(f"(x={x}, y={y}, w={w}, h={h})" for x, y, w, h in faces)
-            print(f"[DEBUG] frames={self._debug_frames} faces={len(faces)} {faces_str}")
+        if tracked_faces:
+            faces_str = ", ".join(
+                f"id={track_id}(x={x}, y={y}, w={w}, h={h})"
+                for track_id, (x, y, w, h) in tracked_faces
+            )
+            print(f"[DEBUG] frames={self._debug_frames} faces={len(tracked_faces)} {faces_str}")
         else:
             print(f"[DEBUG] frames={self._debug_frames} faces=0")
+
+    def _report_no_frame(self, source: str) -> None:
+        now = time.time()
+        if now - self._last_no_frame_warn_at < NO_FRAME_WARN_INTERVAL_S:
+            return
+        self._last_no_frame_warn_at = now
+        print(
+            f"[WARNING] No frames received from {source} yet. "
+            "If this persists, camera streaming may be unavailable."
+        )
+
+    def _report_first_frame(self, frame: np.ndarray, source: str) -> None:
+        if self._first_frame_logged:
+            return
+        h, w = frame.shape[:2]
+        print(f"[INFO] First video frame received from {source}: {w}x{h}")
+        self._first_frame_logged = True
+
+    @staticmethod
+    def _pick_primary_track(
+        tracked_faces: list[tuple[int, tuple[int, int, int, int]]]
+    ) -> int | None:
+        if not tracked_faces:
+            return None
+        # Pick biggest visible face as active speaker target.
+        best_track_id, best_box = max(tracked_faces, key=lambda item: item[1][2] * item[1][3])
+        _ = best_box
+        return best_track_id
 
     def _save_detection_frame(self, frame: np.ndarray, faces: list[tuple[int, int, int, int]]) -> None:
         """Save first N frames that contain detections for offline debugging."""
@@ -397,6 +524,59 @@ class MorningGreeter:
                 self._video_error_reported = True
             self._show_video = False
             return False
+
+    def _open_webcam(self) -> cv2.VideoCapture:
+        """Open webcam with backend fallback (Windows-friendly)."""
+        backend_candidates: list[tuple[str, int | None]]
+        if self._webcam_backend == "auto":
+            backend_candidates = [
+                ("msmf", getattr(cv2, "CAP_MSMF", None)),
+                ("dshow", getattr(cv2, "CAP_DSHOW", None)),
+                ("default", None),
+            ]
+        elif self._webcam_backend == "msmf":
+            backend_candidates = [("msmf", getattr(cv2, "CAP_MSMF", None))]
+        elif self._webcam_backend == "dshow":
+            backend_candidates = [("dshow", getattr(cv2, "CAP_DSHOW", None))]
+        else:
+            backend_candidates = [("default", None)]
+
+        for backend_name, backend_flag in backend_candidates:
+            if backend_flag is None and backend_name != "default":
+                continue
+
+            if backend_flag is None:
+                cap = cv2.VideoCapture(self._webcam_index)
+            else:
+                cap = cv2.VideoCapture(self._webcam_index, backend_flag)
+
+            if not cap.isOpened():
+                cap.release()
+                continue
+
+            # Ensure this backend can actually deliver frames.
+            got_frame = False
+            for _ in range(20):
+                ok, _frame = cap.read()
+                if ok:
+                    got_frame = True
+                    break
+                time.sleep(0.03)
+
+            if got_frame:
+                print(
+                    f"[INFO] Webcam opened on index {self._webcam_index} "
+                    f"using backend={backend_name}."
+                )
+                return cap
+
+            cap.release()
+
+        raise RuntimeError(
+            "Could not open webcam with a working backend. "
+            "Try closing other camera apps, switching --webcam-index, "
+            "or forcing --webcam-backend dshow."
+        )
 
     # ── Greeting orchestration ────────────────────────────────────────────────
 
@@ -452,27 +632,65 @@ class MorningGreeter:
             print("[ERROR] reachy_mini not installed. Use --no-robot instead.")
             sys.exit(1)
 
-        print("[INFO] Connecting to Reachy Mini (media_backend=default)...")
-        with ReachyMini(media_backend="default") as mini:
+        print(
+            "[INFO] Connecting to Reachy Mini "
+            f"(host={self._robot_host}:{self._robot_port}, "
+            f"connection_mode={self._connection_mode}, "
+            f"media_backend={self._robot_media_backend})..."
+        )
+        with ReachyMini(
+            robot_name=self._robot_name,
+            host=self._robot_host,
+            port=self._robot_port,
+            connection_mode=self._connection_mode,
+            media_backend=self._robot_media_backend,
+        ) as mini:
             print("[INFO] Connected. Morning Greeter is watching... (Ctrl+C to stop)")
             idle_pose(mini)
             self._running = True
+            first_none_at: float | None = None
 
             while self._running:
                 frame = mini.media.get_frame()
                 if frame is None:
+                    self._report_no_frame("Reachy Mini camera")
+
+                    if first_none_at is None:
+                        first_none_at = time.time()
+
+                    if (
+                        self._fallback_webcam_if_no_robot_video
+                        and (time.time() - first_none_at) >= self._no_frame_timeout_s
+                    ):
+                        print(
+                            "[WARNING] Robot camera stream unavailable. "
+                            "Falling back to webcam for vision while keeping "
+                            "robot control active."
+                        )
+                        self.run_with_webcam(mini=mini)
+                        break
+
                     time.sleep(0.05)
                     continue
 
+                first_none_at = None
+                self._report_first_frame(frame, "Reachy Mini camera")
+
                 faces = self._detector.detect(frame)
-                self._log_detection_debug(faces)
+                tracked_faces = self._tracker.update(faces)
+                self._log_detection_debug(tracked_faces)
 
                 overlay = None
-                if self._show_video or (self._save_detection_frames_remaining > 0 and faces):
-                    overlay = self._draw_debug_overlay(frame, faces)
+                if self._show_video or (self._save_detection_frames_remaining > 0 and tracked_faces):
+                    overlay = self._draw_debug_overlay(
+                        frame,
+                        tracked_faces,
+                        source_label="robot",
+                    )
 
-                if faces:
-                    self._save_detection_frame(overlay if overlay is not None else frame, faces)
+                if tracked_faces:
+                    boxes_only = [box for _, box in tracked_faces]
+                    self._save_detection_frame(overlay if overlay is not None else frame, boxes_only)
 
                 if self._show_video:
                     if self._show_debug_window(
@@ -482,10 +700,10 @@ class MorningGreeter:
                         print("[INFO] Q pressed — stopping.")
                         break
 
-                if faces:
-                    self._tracker.on_face_seen()
-                    if self._tracker.should_greet():
-                        self._tracker.mark_greeted()
+                primary_track_id = self._pick_primary_track(tracked_faces)
+                if primary_track_id is not None:
+                    if self._tracker.should_greet(primary_track_id):
+                        self._tracker.mark_greeted(primary_track_id)
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
 
@@ -500,9 +718,10 @@ class MorningGreeter:
         Pass a connected ReachyMini instance to also drive robot animations.
         Shows an OpenCV preview window with face bounding boxes.
         """
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("[ERROR] Could not open webcam (device 0). Plug in a camera.")
+        try:
+            cap = self._open_webcam()
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}")
             sys.exit(1)
 
         print("[INFO] Webcam open. Morning Greeter is watching... (press Q to quit)")
@@ -514,18 +733,27 @@ class MorningGreeter:
             while self._running:
                 ret, frame = cap.read()
                 if not ret:
+                    self._report_no_frame("webcam")
                     time.sleep(0.05)
                     continue
 
+                self._report_first_frame(frame, "webcam")
+
                 faces = self._detector.detect(frame)
-                self._log_detection_debug(faces)
+                tracked_faces = self._tracker.update(faces)
+                self._log_detection_debug(tracked_faces)
 
                 overlay = None
-                if self._show_video or (self._save_detection_frames_remaining > 0 and faces):
-                    overlay = self._draw_debug_overlay(frame, faces)
+                if self._show_video or (self._save_detection_frames_remaining > 0 and tracked_faces):
+                    overlay = self._draw_debug_overlay(
+                        frame,
+                        tracked_faces,
+                        source_label="webcam",
+                    )
 
-                if faces:
-                    self._save_detection_frame(overlay if overlay is not None else frame, faces)
+                if tracked_faces:
+                    boxes_only = [box for _, box in tracked_faces]
+                    self._save_detection_frame(overlay if overlay is not None else frame, boxes_only)
 
                 if self._show_video:
                     if self._show_debug_window(
@@ -536,10 +764,10 @@ class MorningGreeter:
                         break
 
                 # ── Greeting logic ────────────────────────────────────────────
-                if faces:
-                    self._tracker.on_face_seen()
-                    if self._tracker.should_greet():
-                        self._tracker.mark_greeted()
+                primary_track_id = self._pick_primary_track(tracked_faces)
+                if primary_track_id is not None:
+                    if self._tracker.should_greet(primary_track_id):
+                        self._tracker.mark_greeted(primary_track_id)
                         self._do_greeting(mini)
                         print("[INFO] Back to watching...")
 
@@ -619,6 +847,87 @@ def main(argv: Sequence[str] | None = None) -> None:
         default="debug_detections",
         help="Directory where detection debug frames are saved.",
     )
+    parser.add_argument(
+        "--same-person-cooldown",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help=(
+            "Minimum seconds before greeting the same tracked person again "
+            "(default: 300)."
+        ),
+    )
+    parser.add_argument(
+        "--robot-media-backend",
+        type=str,
+        choices=["default", "local", "webrtc"],
+        default="default",
+        help=(
+            "Media backend for real-robot mode. "
+            "Use webrtc for remote/network robots, local when daemon and app "
+            "run on same machine."
+        ),
+    )
+    parser.add_argument(
+        "--no-frame-timeout",
+        type=float,
+        default=8.0,
+        metavar="SECONDS",
+        help="Seconds to wait for robot camera frames before fallback actions.",
+    )
+    parser.add_argument(
+        "--fallback-webcam-if-no-robot-video",
+        action="store_true",
+        help=(
+            "If robot camera frames never arrive, switch to webcam for vision "
+            "while still controlling the robot."
+        ),
+    )
+    parser.add_argument(
+        "--webcam-index",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Webcam device index for webcam-based vision modes (default: 0).",
+    )
+    parser.add_argument(
+        "--webcam-backend",
+        type=str,
+        choices=["auto", "msmf", "dshow", "default"],
+        default="auto",
+        help=(
+            "OpenCV backend for webcam capture. Use dshow on Windows if msmf "
+            "fails to grab frames."
+        ),
+    )
+    parser.add_argument(
+        "--robot-name",
+        type=str,
+        default="reachy_mini",
+        help="Robot name used by Reachy SDK discovery (default: reachy_mini).",
+    )
+    parser.add_argument(
+        "--robot-host",
+        type=str,
+        default="reachy-mini.local",
+        help="Reachy host or IP for real-robot mode (default: reachy-mini.local).",
+    )
+    parser.add_argument(
+        "--robot-port",
+        type=int,
+        default=8000,
+        help="Reachy daemon port for real-robot mode (default: 8000).",
+    )
+    parser.add_argument(
+        "--connection-mode",
+        type=str,
+        choices=["auto", "localhost_only", "network"],
+        default="auto",
+        help=(
+            "Reachy SDK connection mode. Use network for explicit remote robot host, "
+            "localhost_only for local daemon, auto for SDK auto-detection."
+        ),
+    )
     args = parser.parse_args(argv)
 
     greeter = MorningGreeter(
@@ -627,6 +936,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         debug_detections=args.debug_detections,
         save_detection_frames=args.save_detection_frames,
         save_dir=args.save_dir,
+        same_person_cooldown_s=args.same_person_cooldown,
+        robot_media_backend=args.robot_media_backend,
+        no_frame_timeout_s=args.no_frame_timeout,
+        fallback_webcam_if_no_robot_video=args.fallback_webcam_if_no_robot_video,
+        webcam_index=args.webcam_index,
+        webcam_backend=args.webcam_backend,
+        robot_name=args.robot_name,
+        robot_host=args.robot_host,
+        robot_port=args.robot_port,
+        connection_mode=args.connection_mode,
     )
 
     try:
